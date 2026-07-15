@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AtlasScan — Integration Example</title>
+  <script src="atlasscan.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; }
+    button { padding: 0.6rem 1.4rem; font-size: 1rem; cursor: pointer; }
+    iframe { width: 100%; height: 480px; border: 1px solid #ccc; border-radius: 8px; margin-top: 1rem; display: none; }
+    #info { margin-top: 1rem; color: #444; }
+  </style>
+</head>
+<body>
+
+  <h1>AtlasScan example</h1>
+  <p>
+    Requires <code>AtlasScan.exe</code> running on this machine
+    (see the <code>scan-service</code> folder). Use the
+    "Test Scanner" device to try it without hardware.
+  </p>
+
+  <button onclick="startScan()">Scan a document</button>
+  <button id="uploadBtn" style="display:none;" onclick="uploadPdf()">Upload via API</button>
+  <button id="saveBtn" style="display:none;" onclick="savePdfToDisk()">Save to disk</button>
+  <p id="info"></p>
+  <iframe id="preview" title="Scanned PDF preview"></iframe>
+
+  <script>
+    let scanResult = null;
+
+    async function startScan() {
+      scanResult = await AtlasScan.scan({
+        // serviceUrl: 'http://127.0.0.1:18990',   // default
+        // theme: 'light',                          // 'dark' (default) or 'light'
+        // title: 'Scan Document',
+      });
+
+      const done = !!scanResult;
+      document.getElementById('uploadBtn').style.display = done ? 'inline-block' : 'none';
+      document.getElementById('saveBtn').style.display   = done ? 'inline-block' : 'none';
+
+      if (!done) {
+        document.getElementById('info').textContent = 'Scan cancelled.';
+        return;
+      }
+
+      document.getElementById('info').textContent =
+        'Scanned ' + scanResult.pageCount + ' page(s), PDF size ' +
+        Math.round(scanResult.blob.size / 1024) + ' KB. Upload it or save it to disk.';
+
+      const frame = document.getElementById('preview');
+      frame.src = URL.createObjectURL(scanResult.blob);
+      frame.style.display = 'block';
+    }
+
+    // Option A — send the scanned PDF to your API
+    async function uploadPdf() {
+      const fd = new FormData();
+      fd.append('file', scanResult.blob, 'document.pdf');
+      // fd.append('any_other_field', 'value');
+      // await fetch('https://your-api.example.com/upload', { method: 'POST', body: fd });
+      document.getElementById('info').textContent =
+        'This demo has no API — see the commented fetch() in uploadPdf().';
+    }
+
+    // Option B — save the scanned PDF to the user's disk instead
+    function savePdfToDisk() {
+      const url = URL.createObjectURL(scanResult.blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'document.pdf';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+  </script>
+
+</body>
+</html>
