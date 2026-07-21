@@ -287,7 +287,13 @@ static class AtlasScanService
         bool feeder = source == "feeder" || source == "feeder-duplex";
         bool duplex = source == "feeder-duplex";
         // Document Handling Select: 1=FEEDER, 2=FLATBED, 4=DUPLEX (combined with FEEDER)
-        TrySetProp(device.Properties, "3088", duplex ? 5 : (feeder ? 1 : 2));
+        int wantHandling = duplex ? 5 : (feeder ? 1 : 2);
+        TrySetProp(device.Properties, "3088", wantHandling);
+        if (feeder && !HandlingSelectApplied(device.Properties, wantHandling))
+        {
+            Log("  feeder requested but driver kept a different Document Handling Select value — aborting instead of silently scanning the flatbed.");
+            return Err("This scanner didn't accept the feeder as the paper source (no feeder attached, or the driver doesn't support switching). Scan cancelled rather than silently using the flatbed — choose Flatbed if that's what you want, or check the feeder tray.");
+        }
 
         dynamic item = device.Items[1];
         int intent = color == "bw" ? 4 : color == "gray" ? 2 : 1;
@@ -329,6 +335,15 @@ static class AtlasScanService
 
         Log("Scan done: " + pages.Count + " page(s)");
         return new Dictionary<string, object> { { "pages", pages }, { "dpi", dpi } };
+    }
+
+    // Confirms the driver actually kept the Document Handling Select value we asked for.
+    // Some drivers accept the write but silently clamp/normalize it back to flatbed when,
+    // e.g., no feeder is attached — TrySetProp only sees a successful call, not that.
+    static bool HandlingSelectApplied(dynamic props, int expected)
+    {
+        try { return Convert.ToInt32(props["3088"].Value) == expected; }
+        catch { return true; } // can't read it back — don't block the scan over that
     }
 
     static bool FeederReady(dynamic device)
