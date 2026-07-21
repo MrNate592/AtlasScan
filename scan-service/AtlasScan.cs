@@ -15,18 +15,27 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using NTwain;
+using NTwain.Data;
 
 static class AtlasScanService
 {
     const int Port = 18990;
     const string WiaFormatBmp = "{B96B3CAB-0728-11D3-9D7B-0000F81EF32E}";
+    const int TwainTimeoutMs = 150000;
+    const string DuplexUnsupportedMessage =
+        "This scanner's Windows driver doesn't support double-sided scanning (this is a common limitation — many scanners, " +
+        "including most Epson document scanners, only expose duplex through their own TWAIN software, and even that TWAIN " +
+        "source wasn't found or doesn't support duplex here). Use \"Feeder — Front Only\" and flip the stack for the reverse side instead.";
 
     static readonly object ScanLock = new object();
     static readonly object LogLock = new object();
@@ -46,6 +55,7 @@ static class AtlasScanService
             try { Directory.CreateDirectory(logDir); } catch { }
             _logPath = Path.Combine(logDir, "service.log");
             Log("Service starting on http://127.0.0.1:" + Port);
+            LogTwainEnvironment();
 
             var listener = new TcpListener(IPAddress.Loopback, Port);
             try { listener.Start(); }
@@ -282,12 +292,20 @@ static class AtlasScanService
         if (chosen == null) return Err("Scanner not found. Check it is connected and powered on, then refresh.");
 
         Log("Scan start: device=" + (string)chosen.DeviceID + " source=" + source + " dpi=" + dpi + " color=" + color + " paper=" + paper);
-        dynamic device = chosen.Connect();
 
-        bool feeder = source == "feeder" || source == "feeder-duplex";
-        bool duplex = source == "feeder-duplex";
-        // Document Handling Select: 1=FEEDER, 2=FLATBED, 4=DUPLEX (combined with FEEDER)
-        int wantHandling = duplex ? 5 : (feeder ? 1 : 2);
+        if (source == "feeder-duplex")
+        {
+            string wiaName;
+            try { wiaName = chosen.Properties["Name"].Value.ToString(); } catch { wiaName = null; }
+            return ScanDuplexViaTwain(wiaName, color, paper, dpi, brightness, contrast);
+        }
+
+        dynamic device = chosen.Connect();
+        Log("  driver-reported Document Handling Capabilities (3086): " + ReadHandlingCapabilities(device.Properties));
+
+        bool feeder = source == "feeder"; // "feeder-duplex" is intercepted above, before reaching WIA
+        // Document Handling Select: 1=FEEDER, 2=FLATBED
+        int wantHandling = feeder ? 1 : 2;
         TrySetProp(device.Properties, "3088", wantHandling);
         if (feeder && !HandlingSelectApplied(device.Properties, wantHandling))
         {
@@ -337,6 +355,15 @@ static class AtlasScanService
         return new Dictionary<string, object> { { "pages", pages }, { "dpi", dpi } };
     }
 
+    // Best-effort read of what the driver claims it can do (FEEDER=1, FLATBED=2, DUPLEX=4,
+    // combined as bit flags) — purely diagnostic, logged so a duplex rejection can be
+    // confirmed as a driver limitation without trial-and-error across paper sizes.
+    static string ReadHandlingCapabilities(dynamic props)
+    {
+        try { return Convert.ToInt32(props["3086"].Value).ToString(); }
+        catch (Exception ex) { return "unavailable (" + Root(ex).Message + ")"; }
+    }
+
     // Confirms the driver actually kept the Document Handling Select value we asked for.
     // Some drivers accept the write but silently clamp/normalize it back to flatbed when,
     // e.g., no feeder is attached — TrySetProp only sees a successful call, not that.
@@ -375,6 +402,194 @@ static class AtlasScanService
             img.Save(outMs, JpegCodec(), ep);
             return Convert.ToBase64String(outMs.ToArray());
         }
+    }
+
+    // ── TWAIN (duplex only — WIA handles flatbed/simplex-feeder above) ──
+    //
+    // TWAIN needs a live Windows message loop pumping messages to the driver, unlike WIA's
+    // pure-COM model. NTwain's TwainSession.Open() spins up its own dedicated background
+    // thread with an internal message pump and marshals every stateful call onto it,
+    // blocking the caller until done — so the per-request thread below doesn't need a
+    // pump of its own. The one real risk is a driver that ignores "no UI" and blocks
+    // inside Enable() showing its own dialog; running the whole operation on a throwaway
+    // Thread and Join()-ing it with a timeout (rather than just waiting on a completion
+    // event) covers that case too, and still frees the caller/ScanLock either way.
+
+    static object ScanDuplexViaTwain(string wiaDeviceName, string color, string paper,
+                                      int dpi, int brightness, int contrast)
+    {
+        object result = null;
+        Exception workerCrash = null;
+        var workerFinished = new ManualResetEvent(false);
+
+        var worker = new Thread(() =>
+        {
+            try { result = RunTwainScan(wiaDeviceName, color, paper, dpi, brightness, contrast); }
+            catch (Exception ex) { workerCrash = ex; }
+            finally { workerFinished.Set(); }
+        });
+        worker.IsBackground = true; // never blocks process exit if truly wedged
+        worker.Start();
+
+        if (!workerFinished.WaitOne(TwainTimeoutMs))
+        {
+            Log("  TWAIN scan did not finish within " + TwainTimeoutMs + "ms — returning a timeout error. " +
+                "If a window from the scanner's own software appeared on the PC it may still be open; " +
+                "the worker thread is abandoned in the background.");
+            return Err("The scan timed out. If a window from the scanner's own software appeared on the PC, close it and try again.");
+        }
+        if (workerCrash != null)
+        {
+            Log("  TWAIN worker crashed: " + Root(workerCrash).Message);
+            return Err(Friendly(workerCrash));
+        }
+        return result;
+    }
+
+    static object RunTwainScan(string wiaDeviceName, string color, string paper,
+                                int dpi, int brightness, int contrast)
+    {
+        var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, Assembly.GetExecutingAssembly());
+        var session = new TwainSession(appId);
+        DataSource src = null;
+        try
+        {
+            var rc = session.Open();
+            if (rc != ReturnCode.Success)
+            {
+                Log("  TWAIN session.Open() failed: " + rc);
+                return Err("Could not start the TWAIN driver manager (" + rc + "). Check that twaindsm.dll is installed " +
+                            "(Epson's own scanner software normally installs it).");
+            }
+
+            src = FindTwainSourceForWiaDevice(session, wiaDeviceName);
+            if (src == null) return Err(DuplexUnsupportedMessage);
+
+            if (src.Open() != ReturnCode.Success)
+            {
+                Log("  TWAIN source.Open() failed for " + src.Name);
+                return Err("Could not open the TWAIN scanner driver.");
+            }
+
+            bool duplexOk = src.Capabilities.CapDuplexEnabled.CanSet
+                && (!src.Capabilities.CapDuplex.IsSupported || src.Capabilities.CapDuplex.GetCurrent() != Duplex.None)
+                && src.Capabilities.CapUIControllable.IsSupported;
+            Log("  TWAIN source: " + src.Name + " CapDuplexEnabled.CanSet=" + src.Capabilities.CapDuplexEnabled.CanSet +
+                " CapUIControllable=" + src.Capabilities.CapUIControllable.IsSupported);
+            if (!duplexOk) return Err(DuplexUnsupportedMessage);
+
+            if (src.Capabilities.CapFeederEnabled.CanSet) src.Capabilities.CapFeederEnabled.SetValue(BoolType.True);
+            src.Capabilities.CapDuplexEnabled.SetValue(BoolType.True);
+            if (src.Capabilities.ICapPixelType.CanSet) src.Capabilities.ICapPixelType.SetValue(TwainPixelTypeFor(color));
+            if (src.Capabilities.ICapXResolution.CanSet) src.Capabilities.ICapXResolution.SetValue((float)dpi);
+            if (src.Capabilities.ICapYResolution.CanSet) src.Capabilities.ICapYResolution.SetValue((float)dpi);
+            if (brightness != 0 && src.Capabilities.ICapBrightness.CanSet) src.Capabilities.ICapBrightness.SetValue(brightness * 10f);
+            if (contrast != 0 && src.Capabilities.ICapContrast.CanSet) src.Capabilities.ICapContrast.SetValue(contrast * 10f);
+            session.StopOnTransferError = true;
+
+            var pages = new List<string>();
+            string firstError = null;
+            var done = new ManualResetEvent(false);
+
+            EventHandler<DataTransferredEventArgs> onTransferred = (s, e) =>
+            {
+                try
+                {
+                    if (e.NativeData != IntPtr.Zero)
+                        using (var stream = e.GetNativeImageStream())
+                            if (stream != null) using (var img = System.Drawing.Image.FromStream(stream)) pages.Add(JpegBase64(img));
+                }
+                catch (Exception ex) { Log("  TWAIN page decode failed: " + Root(ex).Message); }
+            };
+            EventHandler<TransferErrorEventArgs> onError = (s, e) =>
+            {
+                firstError = e.Exception != null ? Root(e.Exception).Message : ("TWAIN error " + e.ReturnCode);
+                Log("  TWAIN transfer error: " + firstError);
+            };
+            EventHandler onDisabled = (s, e) => done.Set();
+
+            session.DataTransferred += onTransferred;
+            session.TransferError += onError;
+            session.SourceDisabled += onDisabled;
+            try
+            {
+                var enableRc = src.Enable(SourceEnableMode.NoUI, false, IntPtr.Zero);
+                if (enableRc != ReturnCode.Success)
+                    return Err("The TWAIN scanner would not start (code " + enableRc + ").");
+
+                done.WaitOne(); // bounded by the ScanDuplexViaTwain worker-thread timeout
+
+                if (pages.Count == 0) return Err(firstError ?? "The document feeder is empty. Load pages and try again.");
+
+                Log("TWAIN duplex scan done: " + pages.Count + " page(s)");
+                return new Dictionary<string, object> { { "pages", pages }, { "dpi", dpi } };
+            }
+            finally
+            {
+                session.DataTransferred -= onTransferred;
+                session.TransferError -= onError;
+                session.SourceDisabled -= onDisabled;
+            }
+        }
+        finally
+        {
+            // Teardown order matches NTwain's own sample app.
+            try { if (src != null && session.State == 4) src.Close(); } catch { }
+            try { if (session.State == 3) session.Close(); else if (session.State > 2) session.ForceStepDown(2); } catch { }
+        }
+    }
+
+    static PixelType TwainPixelTypeFor(string color)
+    {
+        return color == "bw" ? PixelType.BlackWhite : color == "gray" ? PixelType.Gray : PixelType.RGB;
+    }
+
+    // WIA and TWAIN enumerate devices independently with no shared ID, so the only way to
+    // find "the TWAIN source for this WIA device" is by comparing vendor product-name strings.
+    static DataSource FindTwainSourceForWiaDevice(TwainSession session, string wiaDeviceName)
+    {
+        if (string.IsNullOrEmpty(wiaDeviceName)) return null;
+        foreach (DataSource src in session.GetSources())
+        {
+            Log("  TWAIN source seen: " + src.Name + " (mfr=" + src.Manufacturer + ")");
+            if (NamesLikelySameScanner(wiaDeviceName, src.Name)) return src;
+        }
+        return null;
+    }
+
+    static bool NamesLikelySameScanner(string wiaName, string twainName)
+    {
+        string a = NormalizeDeviceName(wiaName), b = NormalizeDeviceName(twainName);
+        if (a.Length == 0 || b.Length == 0) return false;
+        if (a.Contains(b) || b.Contains(a)) return true;
+        var bTokens = new HashSet<string>(b.Split(' '));
+        return a.Split(' ').Count(t => t.Length >= 2 && bTokens.Contains(t)) >= 2;
+    }
+
+    static string NormalizeDeviceName(string s)
+    {
+        if (s == null) return "";
+        var sb = new StringBuilder();
+        foreach (char c in s.ToUpperInvariant())
+        {
+            if (char.IsLetterOrDigit(c)) sb.Append(c);
+            else if (sb.Length > 0 && sb[sb.Length - 1] != ' ') sb.Append(' ');
+        }
+        return sb.ToString().Trim();
+    }
+
+    // One-time startup diagnostic: is a TWAIN Data Source Manager even findable for this
+    // process's bitness? Surfaces the answer up front instead of only after a confusing
+    // scan failure — same log file the WIA diagnostics already use.
+    static void LogTwainEnvironment()
+    {
+        try
+        {
+            var p = PlatformInfo.Current;
+            Log("TWAIN environment: 64bit=" + p.IsApp64Bit + " dsmSupported=" + p.IsSupported +
+                " dsmExists=" + p.DsmExists + " expectedDsmPath=" + p.ExpectedDsmPath);
+        }
+        catch (Exception ex) { Log("TWAIN environment check failed: " + Root(ex).Message); }
     }
 
     // ── test scanner (no hardware) ──

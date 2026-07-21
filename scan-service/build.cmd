@@ -11,9 +11,9 @@ if not exist "%CSC%" (
   exit /b 1
 )
 
-"%CSC%" /nologo /target:winexe /out:"%~dp0AtlasScan.exe" ^
+"%CSC%" /nologo /target:winexe /platform:x86 /out:"%~dp0AtlasScan.exe" ^
   /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ^
-  /r:System.Web.Extensions.dll /r:Microsoft.CSharp.dll ^
+  /r:System.Web.Extensions.dll /r:Microsoft.CSharp.dll /r:"%~dp0NTwain.dll" ^
   "%~dp0AtlasScan.cs"
 
 if errorlevel 1 (
