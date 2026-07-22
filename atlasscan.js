@@ -339,7 +339,11 @@
         });
         return chain.then(function () {
           renderPages();
-          setStatus(added + ' page(s) scanned' + (skipped ? ', ' + skipped + ' blank page(s) removed' : '') + '.');
+          if (data.warning) {
+            setStatus(data.warning + ' (' + added + ' page(s) added below.)');
+          } else {
+            setStatus(added + ' page(s) scanned' + (skipped ? ', ' + skipped + ' blank page(s) removed' : '') + '.');
+          }
         });
       })
       .catch(function (err) {

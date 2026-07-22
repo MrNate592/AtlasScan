@@ -431,13 +431,20 @@ static class AtlasScanService
     static object ScanDuplexViaTwain(string wiaDeviceName, string color, string paper,
                                       int dpi, int brightness, int contrast)
     {
+        // Shared with the worker thread so that a timeout can still return whatever pages
+        // DID transfer before the driver stalled, instead of throwing them away. Without
+        // this, a scan that physically ran to completion but never fired the TWAIN "done"
+        // signal would report zero pages to the browser despite the paper having gone
+        // through the feeder.
+        var pages = new List<string>();
+        var pagesLock = new object();
         object result = null;
         Exception workerCrash = null;
         var workerFinished = new ManualResetEvent(false);
 
         var worker = new Thread(() =>
         {
-            try { result = RunTwainScan(wiaDeviceName, color, paper, dpi, brightness, contrast); }
+            try { result = RunTwainScan(wiaDeviceName, color, paper, dpi, brightness, contrast, pages, pagesLock); }
             catch (Exception ex) { workerCrash = ex; }
             finally { workerFinished.Set(); }
         });
@@ -447,11 +454,20 @@ static class AtlasScanService
         if (!workerFinished.WaitOne(TwainTimeoutMs))
         {
             _twainWedged = true;
-            Log("  TWAIN scan did not finish within " + TwainTimeoutMs + "ms — returning a timeout error and refusing " +
-                "further scans until AtlasScan is restarted. If a window from the scanner's own software appeared on " +
-                "the PC it may still be open; the worker thread is abandoned in the background.");
-            return Err("The scan timed out. Restart AtlasScan (right-click the tray icon → Exit, then relaunch it) before scanning again — " +
-                        "if a window from the scanner's own software appeared on the PC, close that too.");
+            List<string> snapshot;
+            lock (pagesLock) { snapshot = new List<string>(pages); }
+            Log("  TWAIN scan did not finish within " + TwainTimeoutMs + "ms (" + snapshot.Count + " page(s) had transferred " +
+                "by then) — refusing further scans until AtlasScan is restarted. If a window from the scanner's own " +
+                "software appeared on the PC it may still be open; the worker thread is abandoned in the background.");
+            if (snapshot.Count > 0)
+            {
+                return new Dictionary<string, object> {
+                    { "pages", snapshot }, { "dpi", dpi },
+                    { "warning", snapshot.Count + " page(s) came through before the scan stalled and never signalled " +
+                                 "completion. Restart AtlasScan (right-click the tray icon → Exit, then relaunch it) before scanning again." }
+                };
+            }
+            return Err("The scan timed out before any pages came through. Restart AtlasScan (right-click the tray icon → Exit, then relaunch it) before scanning again.");
         }
         if (workerCrash != null)
         {
@@ -462,7 +478,8 @@ static class AtlasScanService
     }
 
     static object RunTwainScan(string wiaDeviceName, string color, string paper,
-                                int dpi, int brightness, int contrast)
+                                int dpi, int brightness, int contrast,
+                                List<string> pages, object pagesLock)
     {
         var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, Assembly.GetExecutingAssembly());
         var session = new TwainSession(appId);
@@ -502,17 +519,33 @@ static class AtlasScanService
             if (contrast != 0 && src.Capabilities.ICapContrast.CanSet) src.Capabilities.ICapContrast.SetValue(contrast * 10f);
             session.StopOnTransferError = true;
 
-            var pages = new List<string>();
             string firstError = null;
             var done = new ManualResetEvent(false);
+            int readyCount = 0;
 
+            // Logged verbosely and unconditionally (not just on failure) because a stall with
+            // physical scanning but no output has been observed on this driver, and the only
+            // way to tell "never started transferring" from "transferred fine but never got
+            // the done signal" apart is to see exactly which of these fired before the stall.
+            EventHandler<TransferReadyEventArgs> onReady = (s, e) =>
+            {
+                readyCount++;
+                Log("  TWAIN TransferReady #" + readyCount);
+            };
             EventHandler<DataTransferredEventArgs> onTransferred = (s, e) =>
             {
                 try
                 {
                     if (e.NativeData != IntPtr.Zero)
                         using (var stream = e.GetNativeImageStream())
-                            if (stream != null) using (var img = System.Drawing.Image.FromStream(stream)) pages.Add(JpegBase64(img));
+                            if (stream != null)
+                                using (var img = System.Drawing.Image.FromStream(stream))
+                                {
+                                    string b64 = JpegBase64(img);
+                                    int countNow;
+                                    lock (pagesLock) { pages.Add(b64); countNow = pages.Count; }
+                                    Log("  TWAIN DataTransferred — page " + countNow + " decoded ok");
+                                }
                 }
                 catch (Exception ex) { Log("  TWAIN page decode failed: " + Root(ex).Message); }
             };
@@ -521,8 +554,9 @@ static class AtlasScanService
                 firstError = e.Exception != null ? Root(e.Exception).Message : ("TWAIN error " + e.ReturnCode);
                 Log("  TWAIN transfer error: " + firstError);
             };
-            EventHandler onDisabled = (s, e) => done.Set();
+            EventHandler onDisabled = (s, e) => { Log("  TWAIN SourceDisabled fired"); done.Set(); };
 
+            session.TransferReady += onReady;
             session.DataTransferred += onTransferred;
             session.TransferError += onError;
             session.SourceDisabled += onDisabled;
@@ -534,13 +568,16 @@ static class AtlasScanService
 
                 done.WaitOne(); // bounded by the ScanDuplexViaTwain worker-thread timeout
 
-                if (pages.Count == 0) return Err(firstError ?? "The document feeder is empty. Load pages and try again.");
+                List<string> snapshot;
+                lock (pagesLock) { snapshot = new List<string>(pages); }
+                if (snapshot.Count == 0) return Err(firstError ?? "The document feeder is empty. Load pages and try again.");
 
-                Log("TWAIN duplex scan done: " + pages.Count + " page(s)");
-                return new Dictionary<string, object> { { "pages", pages }, { "dpi", dpi } };
+                Log("TWAIN duplex scan done: " + snapshot.Count + " page(s)");
+                return new Dictionary<string, object> { { "pages", snapshot }, { "dpi", dpi } };
             }
             finally
             {
+                session.TransferReady -= onReady;
                 session.DataTransferred -= onTransferred;
                 session.TransferError -= onError;
                 session.SourceDisabled -= onDisabled;
