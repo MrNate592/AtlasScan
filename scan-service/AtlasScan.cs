@@ -50,6 +50,15 @@ static class AtlasScanService
     // another confusing crash — the tray app needs a restart to actually clear the native state.
     static volatile bool _twainWedged = false;
 
+    // TWAIN's Enable() takes a window handle that some drivers use to post continuation/
+    // confirmation messages back to the app (e.g. between passes of a multi-pass duplex
+    // job) — it is not merely a UI-dialog parent, and passing IntPtr.Zero is a real gotcha:
+    // basic single-page transfers tolerate it, but a driver's mid-job continuation signal
+    // has nowhere to land. This hidden form is never shown; it only exists so its handle is
+    // a real window whose messages are pumped by the main thread's Application.Run() loop.
+    static Form _twainMessageWindow;
+    static IntPtr _twainParentHandle = IntPtr.Zero;
+
     [STAThread]
     static void Main()
     {
@@ -77,6 +86,11 @@ static class AtlasScanService
                     "AtlasScan", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
+
+            // Never shown — exists only so TWAIN has a real window handle to target, pumped
+            // by this thread's Application.Run() loop below. See _twainParentHandle above.
+            _twainMessageWindow = new Form { ShowInTaskbar = false, Opacity = 0, Width = 0, Height = 0 };
+            _twainParentHandle = _twainMessageWindow.Handle; // touching .Handle forces native creation
 
             var acceptThread = new Thread(() => AcceptLoop(listener)) { IsBackground = true };
             acceptThread.Start();
@@ -570,7 +584,7 @@ static class AtlasScanService
             session.SourceDisabled += onDisabled;
             try
             {
-                var enableRc = src.Enable(SourceEnableMode.NoUI, false, IntPtr.Zero);
+                var enableRc = src.Enable(SourceEnableMode.NoUI, false, _twainParentHandle);
                 if (enableRc != ReturnCode.Success)
                     return Err("The TWAIN scanner would not start (code " + enableRc + ").");
 
