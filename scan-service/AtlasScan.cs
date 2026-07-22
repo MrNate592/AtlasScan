@@ -41,6 +41,15 @@ static class AtlasScanService
     static readonly object LogLock = new object();
     static string _logPath;
 
+    // A timed-out TWAIN operation abandons its worker thread rather than killing it (a truly
+    // stuck native driver call often can't be aborted). That orphaned thread can keep holding
+    // the scanner/USB stack, and has been observed corrupting a *later, unrelated* WIA scan on
+    // the same physical device (an OutOfMemoryException from a corrupted COM marshaling
+    // boundary, not real memory pressure). Once that happens there's no reliable in-process
+    // recovery, so every subsequent scan is refused with a clear message instead of risking
+    // another confusing crash — the tray app needs a restart to actually clear the native state.
+    static volatile bool _twainWedged = false;
+
     [STAThread]
     static void Main()
     {
@@ -280,6 +289,10 @@ static class AtlasScanService
 
         if (deviceId == "test") return TestScan(source, paper, color, dpi);
 
+        if (_twainWedged)
+            return Err("A previous double-sided scan didn't finish cleanly and may still be holding the scanner. " +
+                        "Restart AtlasScan (right-click the tray icon → Exit, then relaunch it) before scanning again.");
+
         dynamic dm = Activator.CreateInstance(Type.GetTypeFromProgID("WIA.DeviceManager"));
         dynamic chosen = null;
         int count = dm.DeviceInfos.Count;
@@ -433,10 +446,12 @@ static class AtlasScanService
 
         if (!workerFinished.WaitOne(TwainTimeoutMs))
         {
-            Log("  TWAIN scan did not finish within " + TwainTimeoutMs + "ms — returning a timeout error. " +
-                "If a window from the scanner's own software appeared on the PC it may still be open; " +
-                "the worker thread is abandoned in the background.");
-            return Err("The scan timed out. If a window from the scanner's own software appeared on the PC, close it and try again.");
+            _twainWedged = true;
+            Log("  TWAIN scan did not finish within " + TwainTimeoutMs + "ms — returning a timeout error and refusing " +
+                "further scans until AtlasScan is restarted. If a window from the scanner's own software appeared on " +
+                "the PC it may still be open; the worker thread is abandoned in the background.");
+            return Err("The scan timed out. Restart AtlasScan (right-click the tray icon → Exit, then relaunch it) before scanning again — " +
+                        "if a window from the scanner's own software appeared on the PC, close that too.");
         }
         if (workerCrash != null)
         {
@@ -549,6 +564,7 @@ static class AtlasScanService
     static DataSource FindTwainSourceForWiaDevice(TwainSession session, string wiaDeviceName)
     {
         if (string.IsNullOrEmpty(wiaDeviceName)) return null;
+        Log("  Matching TWAIN sources against WIA device name: \"" + wiaDeviceName + "\"");
         foreach (DataSource src in session.GetSources())
         {
             Log("  TWAIN source seen: " + src.Name + " (mfr=" + src.Manufacturer + ")");
@@ -557,11 +573,18 @@ static class AtlasScanService
         return null;
     }
 
+    // Deliberately conservative: a false match here means Enable() gets called against the
+    // wrong physical source, which can hang for the full TWAIN timeout and — as seen against
+    // a phantom "HP TWAIN USB" stub with no real hardware behind it — leave the driver stack
+    // in a state that corrupts later WIA scans on the real device. A raw substring check
+    // (dropped from an earlier version) let a single generic shared word like "USB" count as
+    // a match; requiring at least two shared, non-trivial tokens (brand + model, typically)
+    // means "no confident match" correctly falls through to the existing duplex-unsupported
+    // error instead of guessing.
     static bool NamesLikelySameScanner(string wiaName, string twainName)
     {
         string a = NormalizeDeviceName(wiaName), b = NormalizeDeviceName(twainName);
         if (a.Length == 0 || b.Length == 0) return false;
-        if (a.Contains(b) || b.Contains(a)) return true;
         var bTokens = new HashSet<string>(b.Split(' '));
         return a.Split(' ').Count(t => t.Length >= 2 && bTokens.Contains(t)) >= 2;
     }
