@@ -506,12 +506,20 @@ static class AtlasScanService
             bool duplexOk = src.Capabilities.CapDuplexEnabled.CanSet
                 && (!src.Capabilities.CapDuplex.IsSupported || src.Capabilities.CapDuplex.GetCurrent() != Duplex.None)
                 && src.Capabilities.CapUIControllable.IsSupported;
+            string duplexMechanism = src.Capabilities.CapDuplex.IsSupported ? src.Capabilities.CapDuplex.GetCurrent().ToString() : "n/a";
             Log("  TWAIN source: " + src.Name + " CapDuplexEnabled.CanSet=" + src.Capabilities.CapDuplexEnabled.CanSet +
-                " CapUIControllable=" + src.Capabilities.CapUIControllable.IsSupported);
+                " CapUIControllable=" + src.Capabilities.CapUIControllable.IsSupported + " CapDuplex(mechanism)=" + duplexMechanism);
             if (!duplexOk) return Err(DuplexUnsupportedMessage);
 
-            if (src.Capabilities.CapFeederEnabled.CanSet) src.Capabilities.CapFeederEnabled.SetValue(BoolType.True);
-            src.Capabilities.CapDuplexEnabled.SetValue(BoolType.True);
+            // Logged, not assumed: a driver can report CanSet=True yet still reject the actual
+            // SetValue call, in which case the scan would silently run simplex instead of duplex.
+            if (src.Capabilities.CapFeederEnabled.CanSet)
+            {
+                var feederRc = src.Capabilities.CapFeederEnabled.SetValue(BoolType.True);
+                if (feederRc != ReturnCode.Success) Log("  TWAIN CapFeederEnabled.SetValue(True) returned " + feederRc);
+            }
+            var duplexRc = src.Capabilities.CapDuplexEnabled.SetValue(BoolType.True);
+            Log("  TWAIN CapDuplexEnabled.SetValue(True) returned " + duplexRc);
             if (src.Capabilities.ICapPixelType.CanSet) src.Capabilities.ICapPixelType.SetValue(TwainPixelTypeFor(color));
             if (src.Capabilities.ICapXResolution.CanSet) src.Capabilities.ICapXResolution.SetValue((float)dpi);
             if (src.Capabilities.ICapYResolution.CanSet) src.Capabilities.ICapYResolution.SetValue((float)dpi);
@@ -566,7 +574,17 @@ static class AtlasScanService
                 if (enableRc != ReturnCode.Success)
                     return Err("The TWAIN scanner would not start (code " + enableRc + ").");
 
-                done.WaitOne(); // bounded by the ScanDuplexViaTwain worker-thread timeout
+                // Polled in slices (instead of one blocking WaitOne) purely for diagnostics —
+                // this thread owns session/src, so logging their state here is safe, and it's
+                // the only way to see *which* TWAIN state a stall is sitting in (e.g. still
+                // "transferring" vs. idle-but-never-disabled) rather than just "it never returned".
+                // Still fully bounded by the outer ScanDuplexViaTwain worker-thread timeout.
+                while (!done.WaitOne(15000))
+                {
+                    int countNow;
+                    lock (pagesLock) { countNow = pages.Count; }
+                    Log("  TWAIN still waiting — session.State=" + session.State + " pages so far=" + countNow);
+                }
 
                 List<string> snapshot;
                 lock (pagesLock) { snapshot = new List<string>(pages); }
